@@ -1,210 +1,615 @@
 <?php
-require_once '../config/db.php';
-if (!isset($_SESSION['user_id']) || $_SESSION['user_role'] !== 'admin') { header("Location: ../login.php"); exit; }
+require_once 'includes/header.php';
 
-$msg = ''; $msg_type = '';
+// ── Filters from GET ──────────────────────────────────────────────
+$cityFilter  = isset($_GET['city'])   ? trim($_GET['city'])   : '';
+$searchQuery = isset($_GET['search']) ? trim($_GET['search']) : '';
 
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
-    if ($_POST['action'] === 'add') {
-        $city = isset($_POST['city']) ? trim($_POST['city']) : 'Other';
-        $stmt = $pdo->prepare("INSERT INTO theatres (name, location, city, total_seats) VALUES (?,?,?,?)");
-        $stmt->execute([trim($_POST['name']), trim($_POST['location']), $city, (int)$_POST['total_seats']]);
-        $msg = "Theatre added successfully!"; $msg_type = 'success';
-    } elseif ($_POST['action'] === 'edit' && isset($_POST['theatre_id'])) {
-        $city = isset($_POST['city']) ? trim($_POST['city']) : 'Other';
-        $stmt = $pdo->prepare("UPDATE theatres SET name=?, location=?, city=?, total_seats=? WHERE id=?");
-        $stmt->execute([trim($_POST['name']), trim($_POST['location']), $city, (int)$_POST['total_seats'], (int)$_POST['theatre_id']]);
-        $msg = "Theatre updated!"; $msg_type = 'success';
-    } elseif ($_POST['action'] === 'delete' && isset($_POST['theatre_id'])) {
-        $stmt = $pdo->prepare("DELETE FROM theatres WHERE id=?");
-        $stmt->execute([(int)$_POST['theatre_id']]);
-        $msg = "Theatre deleted."; $msg_type = 'warn';
+// ── All distinct cities for tabs ──────────────────────────────────
+$cities = $pdo->query("SELECT DISTINCT city FROM theatres WHERE city IS NOT NULL AND city != '' ORDER BY city ASC")->fetchAll(PDO::FETCH_COLUMN);
+
+// ── Fetch theatres (with optional filters) ────────────────────────
+$sql    = "SELECT * FROM theatres WHERE 1=1";
+$params = [];
+
+if ($cityFilter !== '') {
+    $sql .= " AND city = :city";
+    $params[':city'] = $cityFilter;
+}
+if ($searchQuery !== '') {
+    $sql .= " AND (name LIKE :search OR location LIKE :search OR city LIKE :search)";
+    $params[':search'] = '%' . $searchQuery . '%';
+}
+
+$sql .= " ORDER BY name ASC";
+
+$stmt = $pdo->prepare($sql);
+$stmt->execute($params);
+$theatres = $stmt->fetchAll();
+
+// ── For each theatre fetch its currently-playing shows + movies ───
+$theatre_shows = [];
+foreach ($theatres as $t) {
+    $showStmt = $pdo->prepare("
+        SELECT s.id as show_id, s.show_time, s.show_date, s.price,
+               m.id as movie_id, m.title, m.poster_url, m.genre, m.rating, m.duration, m.industry
+        FROM shows s
+        JOIN movies m ON s.movie_id = m.id
+        WHERE s.theatre_id = ? AND s.show_date >= CURDATE()
+        ORDER BY m.title ASC, s.show_date ASC, s.show_time ASC
+    ");
+    $showStmt->execute([$t['id']]);
+    $rows = $showStmt->fetchAll();
+
+    // Group by movie
+    $movies_map = [];
+    foreach ($rows as $row) {
+        $mid = $row['movie_id'];
+        if (!isset($movies_map[$mid])) {
+            $movies_map[$mid] = [
+                'movie_id'   => $row['movie_id'],
+                'title'      => $row['title'],
+                'poster_url' => $row['poster_url'],
+                'genre'      => $row['genre'],
+                'rating'     => $row['rating'],
+                'duration'   => $row['duration'],
+                'industry'   => $row['industry'],
+                'times'      => [],
+                'min_price'  => $row['price'],
+            ];
+        }
+        $movies_map[$mid]['times'][] = [
+            'show_id'   => $row['show_id'],
+            'show_time' => $row['show_time'],
+            'show_date' => $row['show_date'],
+            'price'     => $row['price'],
+        ];
+        if ($row['price'] < $movies_map[$mid]['min_price']) {
+            $movies_map[$mid]['min_price'] = $row['price'];
+        }
     }
+    $theatre_shows[$t['id']] = array_values($movies_map);
 }
-
-$max_setting = $pdo->query("SELECT setting_value FROM admin_settings WHERE setting_key='max_theatres_display'")->fetchColumn();
-$max_theatres = $max_setting ?: 10;
-
-$theatres = $pdo->query("SELECT t.*, COUNT(s.id) as show_count FROM theatres t LEFT JOIN shows s ON t.id=s.theatre_id GROUP BY t.id ORDER BY t.name ASC")->fetchAll();
 ?>
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Theatres – Admin CineTicket</title>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-    <style>
-        :root{--primary:#E50914;--sidebar-bg:#111;--main-bg:#0A0A0A;--card-bg:#1A1A1A;--text:#f1f1f1;--muted:#888;--border:rgba(255,255,255,0.08);}
-        *{margin:0;padding:0;box-sizing:border-box;font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;}
-        body{display:flex;background:var(--main-bg);color:var(--text);min-height:100vh;}
-        .sidebar{width:260px;background:var(--sidebar-bg);display:flex;flex-direction:column;border-right:1px solid var(--border);position:sticky;top:0;height:100vh;overflow-y:auto;flex-shrink:0;}
-        .sidebar-logo{padding:1.8rem 1.5rem;font-size:1.4rem;font-weight:800;color:var(--primary);border-bottom:1px solid var(--border);display:flex;align-items:center;gap:.6rem;}
-        .sidebar-logo span{color:var(--text);}
-        .nav-group-label{font-size:.65rem;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);padding:.8rem 1.5rem .3rem;}
-        .nav-links{list-style:none;}
-        .nav-links li a{display:flex;align-items:center;gap:.8rem;padding:.85rem 1.5rem;color:#aaa;text-decoration:none;font-size:.9rem;font-weight:500;transition:all .25s;border-left:3px solid transparent;}
-        .nav-links li a i{width:18px;text-align:center;}
-        .nav-links li a:hover{color:var(--text);background:rgba(255,255,255,.04);}
-        .nav-links li a.active{color:var(--primary);background:rgba(229,9,20,.08);border-left-color:var(--primary);}
-        .sidebar-footer{margin-top:auto;border-top:1px solid var(--border);}
-        .main-content{flex:1;padding:2rem;overflow-y:auto;min-width:0;}
-        .page-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:1.5rem;}
-        .page-header h2{font-size:1.6rem;}
-        .btn{padding:.6rem 1.2rem;border-radius:8px;font-weight:600;font-size:.88rem;cursor:pointer;border:none;transition:all .25s;text-decoration:none;display:inline-flex;align-items:center;gap:.5rem;}
-        .btn-primary{background:var(--primary);color:white;}.btn-primary:hover{background:#b0060f;}
-        .btn-sm{padding:.35rem .8rem;font-size:.78rem;border-radius:6px;font-weight:600;cursor:pointer;border:none;}
-        .btn-edit{background:rgba(59,130,246,.15);color:#60a5fa;border:1px solid rgba(59,130,246,.3);}.btn-edit:hover{background:#3b82f6;color:white;}
-        .btn-del{background:rgba(229,9,20,.15);color:#f87171;border:1px solid rgba(229,9,20,.3);}.btn-del:hover{background:var(--primary);color:white;}
-        .alert{padding:.9rem 1.2rem;border-radius:8px;margin-bottom:1.5rem;font-size:.9rem;display:flex;align-items:center;gap:.7rem;}
-        .alert-success{background:rgba(34,197,94,.12);border:1px solid rgba(34,197,94,.3);color:#4ade80;}
-        .alert-warn{background:rgba(245,158,11,.12);border:1px solid rgba(245,158,11,.3);color:#fbbf24;}
-        .info-bar{background:rgba(59,130,246,.1);border:1px solid rgba(59,130,246,.25);border-radius:8px;padding:.8rem 1.2rem;margin-bottom:1.5rem;font-size:.85rem;color:#60a5fa;display:flex;align-items:center;gap:.7rem;}
-        .section-card{background:var(--card-bg);border-radius:14px;border:1px solid var(--border);overflow:hidden;}
-        .data-table{width:100%;border-collapse:collapse;}
-        .data-table th{padding:.9rem 1.2rem;text-align:left;font-size:.72rem;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);font-weight:600;border-bottom:1px solid var(--border);}
-        .data-table td{padding:1rem 1.2rem;font-size:.88rem;border-bottom:1px solid rgba(255,255,255,.04);vertical-align:middle;}
-        .data-table tr:last-child td{border-bottom:none;}
-        .data-table tr:hover td{background:rgba(255,255,255,.03);}
-        .seat-bar-bg{background:rgba(255,255,255,.07);border-radius:4px;height:6px;width:100px;overflow:hidden;display:inline-block;}
-        .seat-bar-fill{height:100%;background:var(--primary);border-radius:4px;}
-        .modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);backdrop-filter:blur(6px);z-index:1000;align-items:center;justify-content:center;}
-        .modal-overlay.open{display:flex;}
-        .modal-box{background:#1E1E1E;border:1px solid var(--border);border-radius:16px;padding:2rem;width:480px;max-width:95vw;animation:slideUp .3s ease;}
-        @keyframes slideUp{from{transform:translateY(20px);opacity:0;}to{transform:translateY(0);opacity:1;}}
-        .modal-box h3{font-size:1.1rem;margin-bottom:1.5rem;display:flex;align-items:center;gap:.7rem;}
-        .form-group{margin-bottom:1rem;}
-        .form-group label{display:block;font-size:.8rem;color:var(--muted);margin-bottom:.4rem;}
-        .form-group input{width:100%;background:rgba(255,255,255,.06);border:1px solid var(--border);border-radius:8px;padding:.7rem 1rem;color:var(--text);font-size:.88rem;outline:none;transition:border-color .25s;}
-        .form-group input:focus{border-color:var(--primary);}
-        .modal-actions{display:flex;gap:.8rem;margin-top:1.5rem;}
-        .modal-actions button{flex:1;padding:.8rem;border-radius:8px;font-weight:600;font-size:.9rem;cursor:pointer;border:none;transition:all .25s;}
-        .modal-cancel{background:rgba(255,255,255,.07);color:var(--text);}.modal-cancel:hover{background:rgba(255,255,255,.12);}
-        .modal-confirm{background:var(--primary);color:white;}.modal-confirm:hover{background:#b0060f;}
-        .overflow-x{overflow-x:auto;}
-    </style>
-</head>
-<body>
-<div class="sidebar">
-    <div class="sidebar-logo"><i class="fas fa-film"></i>Cine<span>Ticket</span></div>
-    <div class="nav-group-label">Main</div>
-    <ul class="nav-links"><li><a href="index.php"><i class="fas fa-home"></i> Dashboard</a></li></ul>
-    <div class="nav-group-label">Manage</div>
-    <ul class="nav-links">
-        <li><a href="movies.php"><i class="fas fa-film"></i> Movies</a></li>
-        <li><a href="theatres.php" class="active"><i class="fas fa-building"></i> Theatres</a></li>
-        <li><a href="shows.php"><i class="fas fa-video"></i> Shows</a></li>
-        <li><a href="bookings.php"><i class="fas fa-ticket-alt"></i> Bookings</a></li>
-        <li><a href="index.php?tab=users"><i class="fas fa-users"></i> Users</a></li>
-    </ul>
-    <div class="nav-group-label">Config</div>
-    <ul class="nav-links"><li><a href="settings.php"><i class="fas fa-cog"></i> Settings</a></li></ul>
-    <div class="sidebar-footer"><ul class="nav-links">
-        <li><a href="../index.php" target="_blank"><i class="fas fa-external-link-alt"></i> View Site</a></li>
-        <li><a href="../logout.php"><i class="fas fa-sign-out-alt"></i> Logout</a></li>
-    </ul></div>
-</div>
 
-<div class="main-content">
-    <div class="page-header">
-        <h2><i class="fas fa-building" style="color:var(--primary);margin-right:.6rem;"></i> Theatre Management</h2>
-        <button class="btn btn-primary" onclick="openAddModal()"><i class="fas fa-plus"></i> Add Theatre</button>
-    </div>
-
-    <?php if ($msg): ?>
-    <div class="alert alert-<?php echo $msg_type; ?>"><i class="fas fa-<?php echo $msg_type==='success'?'check-circle':'exclamation-triangle'; ?>"></i> <?php echo $msg; ?></div>
-    <?php endif; ?>
-
-    <div class="info-bar"><i class="fas fa-info-circle"></i> The site displays a maximum of <strong><?php echo $max_theatres; ?></strong> theatres. Manage this limit in <a href="settings.php" style="color:#93c5fd;text-decoration:underline;">Settings</a>.</div>
-
-    <div class="section-card">
-        <div class="overflow-x">
-        <table class="data-table">
-            <thead>
-                <tr><th>#</th><th>Theatre Name</th><th>Location</th><th>City</th><th>Total Seats</th><th>Shows Scheduled</th><th>Actions</th></tr>
-            </thead>
-            <tbody>
-            <?php if (count($theatres) > 0): ?>
-                <?php foreach ($theatres as $t): ?>
-                <tr>
-                    <td style="color:var(--muted);"><?php echo $t['id']; ?></td>
-                    <td><strong><?php echo htmlspecialchars($t['name']); ?></strong></td>
-                    <td style="color:var(--muted); font-size:.85rem;"><i class="fas fa-map-marker-alt" style="color:var(--primary);margin-right:.4rem;"></i><?php echo htmlspecialchars($t['location']); ?></td>
-                    <td><span style="background:rgba(59,130,246,0.15);color:#60a5fa;border:1px solid rgba(59,130,246,0.25);padding:.15rem .55rem;border-radius:4px;font-size:.72rem;font-weight:700;"><?php echo htmlspecialchars($t['city'] ?? 'Other'); ?></span></td>
-                    <td>
-                        <span style="font-weight:700;"><?php echo $t['total_seats']; ?></span>
-                        <div style="margin-top:4px;"><div class="seat-bar-bg"><div class="seat-bar-fill" style="width:<?php echo min(100, ($t['total_seats']/200)*100); ?>%"></div></div></div>
-                    </td>
-                    <td><?php echo $t['show_count']; ?> show<?php echo $t['show_count']!=1?'s':''; ?></td>
-                    <td style="white-space:nowrap;">
-                        <button class="btn-sm btn-edit" onclick="openEditModal(<?php echo $t['id']; ?>, '<?php echo htmlspecialchars(addslashes($t['name'])); ?>', '<?php echo htmlspecialchars(addslashes($t['location'])); ?>', '<?php echo htmlspecialchars(addslashes($t['city'] ?? 'Other')); ?>', <?php echo $t['total_seats']; ?>)"><i class="fas fa-edit"></i> Edit</button>
-                        <form method="POST" style="display:inline;" onsubmit="return confirm('Delete this theatre? All associated shows will also be deleted.')">
-                            <input type="hidden" name="action" value="delete">
-                            <input type="hidden" name="theatre_id" value="<?php echo $t['id']; ?>">
-                            <button type="submit" class="btn-sm btn-del" style="margin-left:4px;"><i class="fas fa-trash"></i></button>
-                        </form>
-                    </td>
-                </tr>
-                <?php endforeach; ?>
-            <?php else: ?>
-                <tr><td colspan="6" style="text-align:center;color:var(--muted);padding:2rem;">No theatres found. Add one!</td></tr>
-            <?php endif; ?>
-            </tbody>
-        </table>
-        </div>
-    </div>
-</div>
-
-<!-- Add Modal -->
-<div class="modal-overlay" id="addModal">
-<div class="modal-box">
-    <h3><i class="fas fa-plus" style="color:var(--primary);"></i> Add New Theatre</h3>
-    <form method="POST">
-        <input type="hidden" name="action" value="add">
-        <div class="form-group"><label>Theatre Name *</label><input type="text" name="name" required placeholder="e.g. PVR IMAX"></div>
-        <div class="form-group"><label>Location *</label><input type="text" name="location" required placeholder="e.g. Phoenix Mall, Bangalore"></div>
-        <div class="form-group"><label>City *</label><input type="text" name="city" required placeholder="e.g. Bangalore"></div>
-        <div class="form-group"><label>Total Seats *</label><input type="number" name="total_seats" required min="1" value="100"></div>
-        <div class="modal-actions">
-            <button type="button" class="modal-cancel" onclick="closeModal('addModal')">Cancel</button>
-            <button type="submit" class="modal-confirm"><i class="fas fa-plus"></i> Add Theatre</button>
-        </div>
-    </form>
-</div>
-</div>
-
-<!-- Edit Modal -->
-<div class="modal-overlay" id="editModal">
-<div class="modal-box">
-    <h3><i class="fas fa-edit" style="color:#60a5fa;"></i> Edit Theatre</h3>
-    <form method="POST" id="editForm">
-        <input type="hidden" name="action" value="edit">
-        <input type="hidden" name="theatre_id" id="editId">
-        <div class="form-group"><label>Theatre Name *</label><input type="text" name="name" id="editName" required></div>
-        <div class="form-group"><label>Location *</label><input type="text" name="location" id="editLocation" required></div>
-        <div class="form-group"><label>City *</label><input type="text" name="city" id="editCity" required></div>
-        <div class="form-group"><label>Total Seats *</label><input type="number" name="total_seats" id="editSeats" required min="1"></div>
-        <div class="modal-actions">
-            <button type="button" class="modal-cancel" onclick="closeModal('editModal')">Cancel</button>
-            <button type="submit" class="modal-confirm"><i class="fas fa-save"></i> Save Changes</button>
-        </div>
-    </form>
-</div>
-</div>
-
-<script>
-function openAddModal() { document.getElementById('addModal').classList.add('open'); }
-function closeModal(id) { document.getElementById(id).classList.remove('open'); }
-function openEditModal(id, name, location, city, seats) {
-    document.getElementById('editId').value       = id;
-    document.getElementById('editName').value     = name;
-    document.getElementById('editLocation').value = location;
-    document.getElementById('editCity').value     = city;
-    document.getElementById('editSeats').value    = seats;
-    document.getElementById('editModal').classList.add('open');
+<style>
+/* ── Hero ── */
+.th-hero {
+    background: linear-gradient(135deg, #0f0f0f 0%, #1a0505 50%, #0f0f0f 100%);
+    padding: 4rem 5% 3rem;
+    text-align: center;
+    position: relative;
+    overflow: hidden;
 }
-document.querySelectorAll('.modal-overlay').forEach(o => o.addEventListener('click', function(e){ if(e.target===this) this.classList.remove('open'); }));
-document.addEventListener('keydown', e => { if(e.key==='Escape') document.querySelectorAll('.modal-overlay.open').forEach(o=>o.classList.remove('open')); });
-</script>
-</body>
-</html>
+.th-hero::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: radial-gradient(ellipse 80% 60% at 50% -10%, rgba(229,9,20,0.18), transparent);
+    pointer-events: none;
+}
+.th-hero h1 {
+    font-size: clamp(2rem, 5vw, 3.2rem);
+    font-weight: 800;
+    margin-bottom: 0.6rem;
+    line-height: 1.15;
+    position: relative;
+}
+.th-hero h1 span { color: var(--primary-color); }
+.th-hero p {
+    color: var(--text-muted);
+    font-size: 1.05rem;
+    margin-bottom: 2rem;
+    position: relative;
+}
+
+/* ── Search bar ── */
+.th-search-form {
+    display: flex;
+    max-width: 520px;
+    margin: 0 auto;
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 50px;
+    overflow: hidden;
+    transition: box-shadow 0.3s, border-color 0.3s;
+    position: relative;
+}
+.th-search-form:focus-within {
+    box-shadow: 0 0 0 3px rgba(229,9,20,0.25);
+    border-color: var(--primary-color);
+}
+.th-search-form input {
+    flex: 1;
+    background: transparent;
+    border: none;
+    outline: none;
+    padding: 0.85rem 1.4rem;
+    color: #fff;
+    font-size: 0.95rem;
+    font-family: 'Inter', sans-serif;
+}
+.th-search-form input::placeholder { color: #888; }
+.th-search-form button {
+    background: var(--primary-color);
+    border: none;
+    padding: 0 1.4rem;
+    color: white;
+    cursor: pointer;
+    font-size: 0.9rem;
+    transition: background 0.25s;
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-weight: 600;
+    white-space: nowrap;
+}
+.th-search-form button:hover { background: #c10710; }
+
+/* ── City tabs ── */
+.city-tabs-wrap {
+    padding: 0 5%;
+    margin: 2rem 0 0;
+    display: flex;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    align-items: center;
+}
+.city-tab {
+    padding: 0.45rem 1.2rem;
+    border-radius: 50px;
+    font-size: 0.82rem;
+    font-weight: 600;
+    text-decoration: none;
+    transition: all 0.25s;
+    border: 1px solid rgba(255,255,255,0.1);
+    color: var(--text-muted);
+    background: rgba(255,255,255,0.05);
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+}
+.city-tab:hover { border-color: var(--primary-color); color: #fff; }
+.city-tab.active {
+    background: var(--primary-color);
+    border-color: var(--primary-color);
+    color: white;
+    box-shadow: 0 0 14px rgba(229,9,20,0.4);
+}
+
+/* ── Section ── */
+.th-section {
+    padding: 2rem 5% 4rem;
+}
+.th-section-title {
+    font-size: 1.4rem;
+    font-weight: 700;
+    margin-bottom: 1.8rem;
+    display: flex;
+    align-items: center;
+    gap: 0.7rem;
+    flex-wrap: wrap;
+}
+.th-section-title i { color: var(--primary-color); }
+.th-count-chip {
+    font-size: 0.78rem;
+    background: rgba(229,9,20,0.15);
+    color: var(--primary-color);
+    border: 1px solid rgba(229,9,20,0.3);
+    padding: 0.2rem 0.7rem;
+    border-radius: 20px;
+    font-weight: 600;
+}
+
+/* ── Theatre grid & cards ── */
+.theatre-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(370px, 1fr));
+    gap: 1.8rem;
+}
+.theatre-card {
+    background: var(--card-bg);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 16px;
+    overflow: hidden;
+    transition: border-color 0.3s, box-shadow 0.3s, transform 0.3s;
+    display: flex;
+    flex-direction: column;
+    animation: fadeSlideUp 0.45s ease both;
+}
+.theatre-card:hover {
+    border-color: rgba(229,9,20,0.4);
+    box-shadow: 0 8px 40px rgba(229,9,20,0.12);
+    transform: translateY(-4px);
+}
+
+/* Theatre header */
+.tc-header {
+    padding: 1.3rem 1.4rem 1rem;
+    display: flex;
+    align-items: flex-start;
+    gap: 0.9rem;
+    border-bottom: 1px solid rgba(255,255,255,0.06);
+}
+.tc-icon {
+    width: 46px; height: 46px;
+    border-radius: 12px;
+    background: linear-gradient(135deg, rgba(229,9,20,0.2), rgba(229,9,20,0.05));
+    border: 1px solid rgba(229,9,20,0.25);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.2rem;
+    color: var(--primary-color);
+    flex-shrink: 0;
+}
+.tc-info { flex: 1; min-width: 0; }
+.tc-info h3 {
+    font-size: 1.05rem;
+    font-weight: 700;
+    margin-bottom: 0.25rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.tc-location {
+    color: var(--text-muted);
+    font-size: 0.8rem;
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    margin-bottom: 0.5rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.tc-location i { color: var(--primary-color); font-size: 0.72rem; flex-shrink: 0; }
+.tc-badges { display: flex; gap: 0.4rem; flex-wrap: wrap; }
+.tc-badge {
+    font-size: 0.68rem;
+    font-weight: 700;
+    padding: 0.18rem 0.55rem;
+    border-radius: 4px;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+}
+.badge-city  { background: rgba(59,130,246,0.15); color: #60a5fa; border: 1px solid rgba(59,130,246,0.25); }
+.badge-seats { background: rgba(34,197,94,0.12);  color: #4ade80; border: 1px solid rgba(34,197,94,0.25); }
+
+/* Movies list */
+.tc-movies {
+    padding: 1rem 1.4rem 0.8rem;
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+}
+.tc-movies-label {
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    color: var(--text-muted);
+    font-weight: 600;
+    margin-bottom: 0.7rem;
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+}
+.tc-movies-label i { color: var(--primary-color); }
+
+.tc-movie-row {
+    display: flex;
+    align-items: center;
+    gap: 0.85rem;
+    padding: 0.65rem 0;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+    transition: padding-left 0.2s;
+}
+.tc-movie-row:last-child { border-bottom: none; }
+.tc-movie-row:hover { padding-left: 4px; }
+
+.tc-movie-poster {
+    width: 36px; height: 50px;
+    object-fit: cover;
+    border-radius: 5px;
+    flex-shrink: 0;
+    border: 1px solid rgba(255,255,255,0.1);
+    background: #1e1e1e;
+}
+.tc-movie-details { flex: 1; min-width: 0; }
+.tc-movie-title {
+    font-size: 0.86rem;
+    font-weight: 600;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    margin-bottom: 0.2rem;
+}
+.tc-movie-meta {
+    font-size: 0.72rem;
+    color: var(--text-muted);
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    flex-wrap: wrap;
+}
+.tc-movie-meta .dot { opacity: 0.35; }
+.tc-movie-meta .rating { color: #f59e0b; font-weight: 600; }
+
+.tc-times {
+    display: flex;
+    gap: 0.28rem;
+    flex-wrap: wrap;
+    margin-top: 0.3rem;
+}
+.time-chip {
+    font-size: 0.67rem;
+    font-weight: 600;
+    background: rgba(229,9,20,0.1);
+    color: #f87171;
+    border: 1px solid rgba(229,9,20,0.2);
+    padding: 0.12rem 0.45rem;
+    border-radius: 4px;
+    white-space: nowrap;
+}
+.time-chip-more {
+    font-size: 0.67rem;
+    font-weight: 600;
+    background: rgba(255,255,255,0.05);
+    color: #888;
+    border: 1px solid rgba(255,255,255,0.08);
+    padding: 0.12rem 0.45rem;
+    border-radius: 4px;
+}
+
+.tc-book-btn {
+    padding: 0.38rem 0.85rem;
+    border-radius: 6px;
+    background: var(--primary-color);
+    color: white;
+    font-size: 0.72rem;
+    font-weight: 700;
+    text-decoration: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    transition: background 0.2s, transform 0.15s;
+    flex-shrink: 0;
+}
+.tc-book-btn:hover { background: #c10710; transform: scale(1.05); }
+
+.tc-no-shows {
+    color: var(--text-muted);
+    font-size: 0.84rem;
+    padding: 1.2rem 0;
+    text-align: center;
+    opacity: 0.65;
+}
+.tc-no-shows i { margin-right: 0.4rem; }
+
+/* Card footer */
+.tc-footer {
+    padding: 0.75rem 1.4rem;
+    border-top: 1px solid rgba(255,255,255,0.06);
+    background: rgba(255,255,255,0.02);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 0.78rem;
+    color: var(--text-muted);
+}
+.tc-footer-count { display: flex; align-items: center; gap: 0.4rem; }
+.tc-footer-count i { color: var(--primary-color); }
+.tc-browse-link {
+    color: var(--primary-color);
+    font-weight: 600;
+    text-decoration: none;
+    font-size: 0.76rem;
+    display: flex;
+    align-items: center;
+    gap: 0.3rem;
+}
+.tc-browse-link:hover { text-decoration: underline; }
+
+/* Empty state */
+.th-empty {
+    text-align: center;
+    padding: 5rem 2rem;
+    color: var(--text-muted);
+}
+.th-empty i { font-size: 3.5rem; display: block; margin-bottom: 1rem; opacity: 0.3; }
+.th-empty p { font-size: 1rem; margin-bottom: 1.2rem; }
+.th-empty a {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    color: var(--primary-color);
+    font-weight: 600;
+    text-decoration: none;
+    padding: 0.6rem 1.4rem;
+    border: 1px solid rgba(229,9,20,0.4);
+    border-radius: 8px;
+    transition: background 0.25s;
+}
+.th-empty a:hover { background: rgba(229,9,20,0.1); }
+
+/* Animation */
+@keyframes fadeSlideUp {
+    from { opacity: 0; transform: translateY(22px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+
+@media (max-width: 600px) {
+    .theatre-grid { grid-template-columns: 1fr; }
+    .th-hero h1 { font-size: 1.8rem; }
+    .tc-header { gap: 0.7rem; }
+}
+</style>
+
+<!-- HERO -->
+<section class="th-hero fade-in">
+    <h1>Find <span>Theatres</span> Near You</h1>
+    <p>Browse cinemas by city &amp; book tickets instantly for your favourite movies</p>
+
+    <form action="theatres.php" method="GET" class="th-search-form">
+        <?php if ($cityFilter): ?>
+            <input type="hidden" name="city" value="<?php echo htmlspecialchars($cityFilter); ?>">
+        <?php endif; ?>
+        <input
+            type="text"
+            name="search"
+            id="theatreSearchInput"
+            placeholder="Search theatre name or area…"
+            value="<?php echo htmlspecialchars($searchQuery); ?>"
+            autocomplete="off"
+        >
+        <button type="submit"><i class="fas fa-search"></i> Search</button>
+    </form>
+</section>
+
+<!-- CITY FILTER TABS -->
+<div class="city-tabs-wrap fade-in" style="animation-delay:0.15s;">
+    <?php
+        $baseSearch = $searchQuery ? '?search='.urlencode($searchQuery) : '';
+    ?>
+    <a href="theatres.php<?php echo $baseSearch; ?>"
+       class="city-tab <?php echo $cityFilter === '' ? 'active' : ''; ?>">
+        <i class="fas fa-globe-asia"></i> All Cities
+    </a>
+    <?php foreach ($cities as $city): ?>
+        <?php
+            $cityHref = 'theatres.php?city=' . urlencode($city);
+            if ($searchQuery) $cityHref .= '&search=' . urlencode($searchQuery);
+        ?>
+        <a href="<?php echo $cityHref; ?>"
+           class="city-tab <?php echo $cityFilter === $city ? 'active' : ''; ?>">
+            <i class="fas fa-map-marker-alt"></i> <?php echo htmlspecialchars($city); ?>
+        </a>
+    <?php endforeach; ?>
+</div>
+
+<!-- THEATRES GRID -->
+<section class="th-section fade-in" style="animation-delay:0.28s;">
+    <div class="th-section-title">
+        <i class="fas fa-building"></i>
+        <?php
+            if ($cityFilter)      echo htmlspecialchars($cityFilter) . ' Theatres';
+            elseif ($searchQuery) echo 'Search Results';
+            else                  echo 'All Theatres';
+        ?>
+        <span class="th-count-chip"><?php echo count($theatres); ?> found</span>
+    </div>
+
+    <?php if (count($theatres) > 0): ?>
+    <div class="theatre-grid">
+        <?php foreach ($theatres as $idx => $t):
+            $t_movies = $theatre_shows[$t['id']];
+            $total_shows = array_sum(array_map(fn($m) => count($m['times']), $t_movies));
+            $delay = $idx * 0.07;
+        ?>
+        <div class="theatre-card" style="animation-delay:<?php echo $delay; ?>s;">
+
+            <!-- Header -->
+            <div class="tc-header">
+                <div class="tc-icon"><i class="fas fa-film"></i></div>
+                <div class="tc-info">
+                    <h3><?php echo htmlspecialchars($t['name']); ?></h3>
+                    <div class="tc-location" title="<?php echo htmlspecialchars($t['location']); ?>">
+                        <i class="fas fa-map-marker-alt"></i>
+                        <?php echo htmlspecialchars($t['location']); ?>
+                    </div>
+                    <div class="tc-badges">
+                        <span class="tc-badge badge-city">
+                            <i class="fas fa-city"></i> <?php echo htmlspecialchars($t['city']); ?>
+                        </span>
+                        <span class="tc-badge badge-seats">
+                            <i class="fas fa-chair"></i> <?php echo number_format($t['total_seats']); ?> seats
+                        </span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Movies currently showing at this theatre -->
+            <div class="tc-movies">
+                <div class="tc-movies-label">
+                    <i class="fas fa-clapperboard"></i>
+                    Now Showing — <?php echo count($t_movies); ?> film<?php echo count($t_movies) != 1 ? 's' : ''; ?>
+                </div>
+
+                <?php if (count($t_movies) > 0): ?>
+                    <?php foreach ($t_movies as $m): ?>
+                    <div class="tc-movie-row">
+                        <img
+                            class="tc-movie-poster"
+                            src="<?php echo htmlspecialchars($m['poster_url']); ?>"
+                            alt="<?php echo htmlspecialchars($m['title']); ?>"
+                            onerror="this.style.opacity='0';"
+                            loading="lazy"
+                        >
+                        <div class="tc-movie-details">
+                            <div class="tc-movie-title"><?php echo htmlspecialchars($m['title']); ?></div>
+                            <div class="tc-movie-meta">
+                                <span><?php echo htmlspecialchars($m['genre']); ?></span>
+                                <span class="dot">•</span>
+                                <span><?php echo $m['duration']; ?> min</span>
+                                <span class="dot">•</span>
+                                <span class="rating">
+                                    <i class="fas fa-star" style="font-size:0.62rem;"></i>
+                                    <?php echo number_format($m['rating'],1); ?>
+                                </span>
+                                <span class="dot">•</span>
+                                <span>From ₹<?php echo number_format($m['min_price'],0); ?></span>
+                            </div>
+                            <div class="tc-times">
+                                <?php foreach (array_slice($m['times'], 0, 4) as $st): ?>
+                                    <span class="time-chip"><?php echo date('h:i A', strtotime($st['show_time'])); ?></span>
+                                <?php endforeach; ?>
+                                <?php if (count($m['times']) > 4): ?>
+                                    <span class="time-chip-more">+<?php echo count($m['times']) - 4; ?> more</span>
+                                <?php endif; ?>
+                            </div>
+                        </div>
+                        <a href="booking.php?movie_id=<?php echo $m['movie_id']; ?>" class="tc-book-btn">
+                            <i class="fas fa-ticket-alt"></i> Book
+                        </a>
+                    </div>
+                    <?php endforeach; ?>
+
+                <?php else: ?>
+                    <div class="tc-no-shows">
+                        <i class="fas fa-calendar-times"></i>
+                        No shows scheduled right now
+                    </div>
+                <?php endif; ?>
+            </div>
+
+            <!-- Footer -->
+            <div class="tc-footer">
+                <span class="tc-footer-count">
+                    <i class="fas fa-ticket-alt"></i>
+                    <?php echo $total_shows; ?> show<?php echo $total_shows != 1 ? 's' : ''; ?> available
+                </span>
+                <a href="index.php" class="tc-browse-link">
+                    Browse all movies <i class="fas fa-arrow-right" style="font-size:0.65rem;"></i>
+                </a>
+            </div>
+
+        </div>
+        <?php endforeach; ?>
+    </div>
+
+    <?php else: ?>
+    <div class="th-empty">
+        <i class="fas fa-building"></i>
+        <p>
+            <?php
+                if ($searchQuery)   echo 'No theatres found for &ldquo;' . htmlspecialchars($searchQuery) . '&rdquo;';
+                elseif ($cityFilter) echo 'No theatres found in &ldquo;' . htmlspecialchars($cityFilter) . '&rdquo;';
+                else                 echo 'No theatres available at the moment.';
+            ?>
+        </p>
+        <a href="theatres.php"><i class="fas fa-redo"></i> View all theatres</a>
+    </div>
+    <?php endif; ?>
+</section>
+
+<?php require_once 'includes/footer.php'; ?>
